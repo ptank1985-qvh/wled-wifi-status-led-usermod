@@ -1,5 +1,5 @@
 {
-  "name": "WiFi Status LED Usermod",
+  "name": "wled-wifi-status-led-usermod",
   "version": "1.0.0",
   "description": "WLED Usermod for displaying WiFi, MQTT, and Home Assistant status using a dual-colour Red + Blue LED",
   "repository": {
@@ -8,5 +8,6 @@
   },
   "license": "MIT",
   "frameworks": "arduino",
-  "platforms": "*"
+  "platforms": "*",
+  "libArchive": false
 }
