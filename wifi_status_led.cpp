@@ -1,371 +1,574 @@
 #include "wled.h"
 
-/*
- * Usermods allow you to add own functionality to WLED without touching core source files.
- * See the WLED docs: https://kno.wled.ge/advanced/custom-features/
- *
- * This is an example usermod. It demonstrates:
- *   - persistent settings via addToConfig() / readFromConfig()
- *   - JSON state read/write via addToJsonState() / readFromJsonState()
- *   - MQTT subscribe and message handling (guarded by WLED_DISABLE_MQTT)
- *   - button event handling
- *   - the Usermod Settings page via appendConfigData()
- *
- * To create your own usermod:
- *   1. Click "Use this template" on https://github.com/wled/wled-usermod-example to create your own repo.
- *   2. Rename the class and file to something descriptive.
- *   3. Reference your new repo in platformio_override.ini via custom_usermods.
- *
- * REGISTER_USERMOD() at the bottom self-registers the instance — no other
- * file edits are needed.
- */
+class WiFiStatusLEDUsermod : public Usermod {
 
-//class name. Use something descriptive and leave the ": public Usermod" part :)
-class MyExampleUsermod : public Usermod {
+private:
 
-  private:
+  bool enabled = true;
 
-    // Private class members. You can declare variables and functions only accessible to your usermod here
-    bool enabled = false;
-    bool initDone = false;
-    unsigned long lastTime = 0;
+  int8_t redPin = -1;
+  int8_t bluePin = -1;
 
-    // config variables — boot defaults can be set here or inside readFromConfig()
-    bool testBool = false;
-    unsigned long testULong = 42424242;
-    float testFloat = 42.42;
-    String testString = "Forty-Two";
-    uint16_t greatValue = 0;  // example persistent value exposed in JSON state
+  bool polarityHigh = true;
+  uint8_t blinkHz = 1;
 
-    // These config variables have defaults set inside readFromConfig()
-    int testInt;
-    long testLong;
-    int8_t testPins[2];
+  bool mqttEnabled = true;
+  bool haEnabled = true;
 
-    // string that are used multiple time (this will save some flash memory)
-    static const char _name[];
-    static const char _enabled[];
+  bool initDone = false;
 
+  int8_t activeRedPin = -1;
+  int8_t activeBluePin = -1;
 
-    // any private methods should go here (non-inline method should be defined out of class)
-    void publishMqtt(const char* state, bool retain = false); // example for publishing MQTT message
+  bool haConnected = false;
 
+  unsigned long lastBlinkTime = 0;
+  unsigned long lastHaFlashTime = 0;
+  unsigned long haFlashStartTime = 0;
+  unsigned long lastHaActivityTime = 0;
 
-  public:
+  bool blinkState = false;
+  bool haFlashActive = false;
 
-    // non WLED related methods, may be used for data exchange between usermods (non-inline methods should be defined out of class)
+  static const char _name[];
+  static const char _enabled[];
 
-    /**
-     * Enable/Disable the usermod
-     */
-    inline void enable(bool enable) { enabled = enable; }
+  void writeLED(int8_t pin, bool on)
+  {
+    if (pin < 0) return;
 
-    /**
-     * Get usermod enabled/disabled state
-     */
-    inline bool isEnabled() { return enabled; }
+    bool outputState = polarityHigh ? on : !on;
+    digitalWrite(pin, outputState ? HIGH : LOW);
+  }
 
-    // To access this usermod from another usermod, cast the result of UsermodManager::lookup():
-    //   MyExampleUsermod* um = (MyExampleUsermod*) UsermodManager::lookup(USERMOD_ID_MYUSERMOD);
-    // Make sure to assign a unique ID in getId()!
+  void setRed(bool on)
+  {
+    writeLED(activeRedPin, on);
+  }
 
+  void setBlue(bool on)
+  {
+    writeLED(activeBluePin, on);
+  }
+
+  void setPurple(bool on)
+  {
+    setRed(on);
+    setBlue(on);
+  }
+
+  void allOff()
+  {
+    setRed(false);
+    setBlue(false);
+  }
+
+  void releasePins()
+  {
+    allOff();
+
+    if (activeRedPin >= 0) {
+      PinManager::deallocatePin(
+        activeRedPin,
+        PinOwner::UM_WiFiStatusLED
+      );
+      activeRedPin = -1;
+    }
+
+    if (activeBluePin >= 0) {
+      PinManager::deallocatePin(
+        activeBluePin,
+        PinOwner::UM_WiFiStatusLED
+      );
+      activeBluePin = -1;
+    }
+  }
+
+  void allocatePins()
+  {
+    activeRedPin = -1;
+    activeBluePin = -1;
+
+    if (!enabled) {
+      allOff();
+      return;
+    }
+
+    if (redPin >= 0) {
+      if (PinManager::allocatePin(
+            redPin,
+            true,
+            PinOwner::UM_WiFiStatusLED
+          )) {
+        activeRedPin = redPin;
+        pinMode(activeRedPin, OUTPUT);
+      } else {
+        DEBUG_PRINTF(
+          "WiFiStatusLED: Red GPIO %d unavailable.\n",
+          redPin
+        );
+      }
+    }
+
+    if (bluePin >= 0) {
+      if (
+        bluePin != activeRedPin &&
+        PinManager::allocatePin(
+          bluePin,
+          true,
+          PinOwner::UM_WiFiStatusLED
+        )
+      ) {
+        activeBluePin = bluePin;
+        pinMode(activeBluePin, OUTPUT);
+      } else if (bluePin == activeRedPin) {
+        DEBUG_PRINTF(
+          "WiFiStatusLED: Blue GPIO %d conflicts with Red GPIO.\n",
+          bluePin
+        );
+      } else {
+        DEBUG_PRINTF(
+          "WiFiStatusLED: Blue GPIO %d unavailable.\n",
+          bluePin
+        );
+      }
+    }
+
+    allOff();
+  }
+
+  void resetRuntime()
+  {
+    blinkState = false;
+    lastBlinkTime = millis();
+
+    haFlashActive = false;
+    haFlashStartTime = 0;
+    lastHaFlashTime = millis();
+    lastHaActivityTime = 0;
+  }
+
+  /*
+   * Home Assistant detection uses the same direct WebSocket/API
+   * activity logic that works in the reference code.
+   *
+   * MQTT remains fully enabled and is still used for the normal
+   * MQTT-connected purple status.
+   */
+  void checkDirectHAConnection()
+  {
+    if (!haEnabled) {
+      haConnected = false;
+      return;
+    }
+
+    unsigned long now = millis();
+
+    if (ws.count() > 0) {
+      if (!haConnected) {
+        haConnected = true;
+        lastHaFlashTime = now;
+      }
+
+      lastHaActivityTime = now;
+    } else {
+      if (
+        haConnected &&
+        (now - lastHaActivityTime > 15000UL)
+      ) {
+        haConnected = false;
+        haFlashActive = false;
+      }
+    }
+  }
+
+  void updateStatusLED()
+  {
+    if (!enabled) {
+      allOff();
+      return;
+    }
 
     /*
-     * setup() is called once at boot. WiFi is not yet connected at this point.
-     * readFromConfig() is called prior to setup()
-     * You can use it to initialize variables, sensors or similar.
+     * Direct Home Assistant connection:
+     * Purple static + short OFF flash every 3 seconds.
+     *
+     * MQTT is NOT disabled here. MQTT continues to work normally.
      */
-    void setup() override {
-      // do your set-up here
-      //Serial.println("Hello from my usermod!");
+    checkDirectHAConnection();
+
+    if (
+      haEnabled &&
+      WLED_CONNECTED &&
+      haConnected
+    ) {
+      unsigned long now = millis();
+
+      if (
+        !haFlashActive &&
+        (now - lastHaFlashTime >= 3000UL)
+      ) {
+        haFlashActive = true;
+        haFlashStartTime = now;
+        setPurple(false);
+      }
+
+      if (haFlashActive) {
+        if (
+          now - haFlashStartTime >= 180UL
+        ) {
+          haFlashActive = false;
+          lastHaFlashTime = now;
+          setPurple(true);
+        } else {
+          setPurple(false);
+        }
+      } else {
+        setPurple(true);
+      }
+
+      return;
+    }
+
+    /*
+     * MQTT connected:
+     * Purple static.
+     */
+    if (
+      mqttEnabled &&
+      WLED_MQTT_CONNECTED
+    ) {
+      setPurple(true);
+      return;
+    }
+
+    /*
+     * WiFi connected:
+     * Blue static.
+     */
+    if (WLED_CONNECTED) {
+      setBlue(true);
+      setRed(false);
+      return;
+    }
+
+    /*
+     * WLED AP mode:
+     * Red static.
+     */
+    if (apActive) {
+      setRed(true);
+      setBlue(false);
+      return;
+    }
+
+    /*
+     * WiFi discovery / connecting:
+     * Red blinking at selected frequency.
+     */
+    unsigned long halfPeriod =
+      1000UL / (2UL * blinkHz);
+
+    unsigned long now = millis();
+
+    if (
+      now - lastBlinkTime >= halfPeriod
+    ) {
+      lastBlinkTime = now;
+      blinkState = !blinkState;
+    }
+
+    setRed(blinkState);
+    setBlue(false);
+  }
+
+public:
+
+  void setup() override
+  {
+    if (!enabled) {
+      allOff();
       initDone = true;
+      return;
     }
 
+    allocatePins();
+    resetRuntime();
 
-    /*
-     * connected() is called every time the WiFi is (re)connected
-     * Use it to initialize network interfaces
-     */
-    void connected() override {
-      //Serial.println("Connected to WiFi!");
+    initDone = true;
+
+    DEBUG_PRINTLN(
+      F("WiFiStatusLED: setup complete.")
+    );
+  }
+
+  void loop() override
+  {
+    updateStatusLED();
+  }
+
+  void connected() override
+  {
+    resetRuntime();
+  }
+
+  /*
+   * WLED API/JSON activity is also used as an HA activity signal.
+   * This is the key part copied from the working reference logic.
+   */
+  void addToJsonInfo(JsonObject& root) override
+  {
+    if (
+      haEnabled &&
+      WLED_CONNECTED
+    ) {
+      lastHaActivityTime = millis();
     }
 
+    JsonObject user = root["u"];
 
-    /*
-     * loop() is called continuously. Here you can check for events, read sensors, etc.
-     * 
-     * Tips:
-     * 1. You can use "if (WLED_CONNECTED)" to check for a successful network connection.
-     *    Additionally, "if (WLED_MQTT_CONNECTED)" is available to check for a connection to an MQTT broker.
-     * 
-     * 2. Try to avoid using the delay() function. NEVER use delays longer than 10 milliseconds.
-     *    Instead, use a timer check as shown here.
-     */
-    void loop() override {
-      // if usermod is disabled or called during strip updating just exit
-      // NOTE: on very long strips strip.isUpdating() may always return true so update accordingly
-      if (!enabled || strip.isUpdating()) return;
-
-      // do your magic here
-      if (millis() - lastTime > 1000) {
-        //Serial.println("I'm alive!");
-        lastTime = millis();
-      }
+    if (user.isNull()) {
+      user = root.createNestedObject("u");
     }
 
+    JsonArray status =
+      user.createNestedArray(FPSTR(_name));
 
-    /*
-     * addToJsonInfo() can be used to add custom entries to the /json/info part of the JSON API.
-     * Creating an "u" object allows you to add custom key/value pairs to the Info section of the WLED web UI.
-     * Below it is shown how this could be used for e.g. a light sensor
-     */
-    void addToJsonInfo(JsonObject& root) override
-    {
-      // if "u" object does not exist yet wee need to create it
-      JsonObject user = root["u"];
-      if (user.isNull()) user = root.createNestedObject("u");
+    status.add(enabled);
 
-      //this code adds "u":{"ExampleUsermod":[20," lux"]} to the info object
-      //int reading = 20;
-      //JsonArray lightArr = user.createNestedArray(FPSTR(_name))); //name
-      //lightArr.add(reading); //value
-      //lightArr.add(F(" lux")); //unit
-
-      // if you are implementing a sensor usermod, you may publish sensor data
-      //JsonObject sensor = root[F("sensor")];
-      //if (sensor.isNull()) sensor = root.createNestedObject(F("sensor"));
-      //temp = sensor.createNestedArray(F("light"));
-      //temp.add(reading);
-      //temp.add(F("lux"));
+    if (!enabled) {
+      return;
     }
 
+    status.add(activeRedPin);
+    status.add(activeBluePin);
+    status.add(haConnected);
+  }
 
-    /*
-     * addToJsonState() adds entries to the /json/state response. Clients can read and write these.
-     * Use this to expose runtime state that should be controllable via the API.
-     * addToJsonState() is NOT called for presets — use addToConfig() for persistent values.
-     */
-    void addToJsonState(JsonObject& root) override
-    {
-      if (!initDone || !enabled) return;  // prevent crash on boot applyPreset()
+  void addToConfig(JsonObject& root) override
+  {
+    JsonObject top =
+      root.createNestedObject(FPSTR(_name));
 
-      JsonObject usermod = root[FPSTR(_name)];
-      if (usermod.isNull()) usermod = root.createNestedObject(FPSTR(_name));
+    top[FPSTR(_enabled)] = enabled;
 
-      usermod["greatValue"] = greatValue;
+    JsonArray pins =
+      top.createNestedArray("pin");
+
+    pins.add(redPin);
+    pins.add(bluePin);
+
+    top["polarity"] =
+      polarityHigh ? 0 : 1;
+
+    top["blinkHz"] =
+      blinkHz;
+
+    top["mqttEnabled"] =
+      mqttEnabled;
+
+    top["haEnabled"] =
+      haEnabled;
+  }
+
+  bool readFromConfig(JsonObject& root) override
+  {
+    int8_t oldRedPin = redPin;
+    int8_t oldBluePin = bluePin;
+    bool oldEnabled = enabled;
+
+    JsonObject top =
+      root[FPSTR(_name)];
+
+    bool configComplete =
+      !top.isNull();
+
+    configComplete &=
+      getJsonValue(
+        top[FPSTR(_enabled)],
+        enabled,
+        true
+      );
+
+    configComplete &=
+      getJsonValue(
+        top["pin"][0],
+        redPin,
+        -1
+      );
+
+    configComplete &=
+      getJsonValue(
+        top["pin"][1],
+        bluePin,
+        -1
+      );
+
+    int8_t polarity =
+      polarityHigh ? 0 : 1;
+
+    configComplete &=
+      getJsonValue(
+        top["polarity"],
+        polarity,
+        0
+      );
+
+    polarityHigh =
+      (polarity == 0);
+
+    configComplete &=
+      getJsonValue(
+        top["blinkHz"],
+        blinkHz,
+        1
+      );
+
+    if (
+      blinkHz != 1 &&
+      blinkHz != 2 &&
+      blinkHz != 4 &&
+      blinkHz != 8
+    ) {
+      blinkHz = 1;
     }
 
+    configComplete &=
+      getJsonValue(
+        top["mqttEnabled"],
+        mqttEnabled,
+        true
+      );
 
-    /*
-     * readFromJsonState() receives values a client POSTs to /json/state.
-     * The JSON key nesting matches what addToJsonState() writes — clients send back the same structure.
-     */
-    void readFromJsonState(JsonObject& root) override
-    {
-      if (!initDone) return;  // prevent crash on boot applyPreset()
+    configComplete &=
+      getJsonValue(
+        top["haEnabled"],
+        haEnabled,
+        true
+      );
 
-      JsonObject usermod = root[FPSTR(_name)];
-      if (!usermod.isNull()) {
-        // getJsonValue copies the value if present and returns true; leaves the variable unchanged if missing
-        getJsonValue(usermod["greatValue"], greatValue);
-      }
-    }
+    if (
+      initDone &&
+      (
+        redPin != oldRedPin ||
+        bluePin != oldBluePin ||
+        enabled != oldEnabled
+      )
+    ) {
+      releasePins();
 
-
-    /*
-     * addToConfig() saves settings to cfg.json under the "um" object. WLED calls this whenever settings are saved.
-     * The Usermod Settings page in the UI is generated automatically from the keys you write here.
-     *
-     * Usermod Settings Overview:
-     * - Numeric values are treated as floats in the browser.
-     *   - If the numeric value entered into the browser contains a decimal point, it will be parsed as a C float
-     *     before being returned to the Usermod.  The float data type has only 6-7 decimal digits of precision, and
-     *     doubles are not supported, numbers will be rounded to the nearest float value when being parsed.
-     *     The range accepted by the input field is +/- 1.175494351e-38 to +/- 3.402823466e+38.
-     *   - If the numeric value entered into the browser doesn't contain a decimal point, it will be parsed as a
-     *     C int32_t (range: -2147483648 to 2147483647) before being returned to the usermod.
-     *     Overflows or underflows are truncated to the max/min value for an int32_t, and again truncated to the type
-     *     used in the Usermod when reading the value from ArduinoJson.
-     * - Pin values can be treated differently from an integer value by using the key name "pin"
-     *   - "pin" can contain a single or array of integer values
-     *   - On the Usermod Settings page there is simple checking for pin conflicts and warnings for special pins
-     *     - Red color indicates a conflict.  Yellow color indicates a pin with a warning (e.g. an input-only pin)
-     *   - Tip: use int8_t to store the pin value in the Usermod, so a -1 value (pin not set) can be used
-     *
-     * To force a config write from loop(), call serializeConfig() — but use it sparingly (flash wear,
-     * possible LED stutter). Never call it from a network callback.
-     */
-    void addToConfig(JsonObject& root) override
-    {
-      JsonObject top = root.createNestedObject(FPSTR(_name));
-      top[FPSTR(_enabled)] = enabled;
-      top["great"] = greatValue;
-      top["testBool"] = testBool;
-      top["testInt"] = testInt;
-      top["testLong"] = testLong;
-      top["testULong"] = testULong;
-      top["testFloat"] = testFloat;
-      top["testString"] = testString;
-      JsonArray pinArray = top.createNestedArray("pin");
-      pinArray.add(testPins[0]);
-      pinArray.add(testPins[1]); 
-    }
-
-
-    /*
-     * readFromConfig() is called before setup() and again after settings are saved.
-     * Return false if any expected keys were missing — WLED will then call addToConfig() to write the defaults.
-     * getJsonValue(src, dest) copies the value if present and returns true; leaves dest unchanged if missing.
-     * getJsonValue(src, dest, default) also assigns a default when the key is absent.
-     */
-    bool readFromConfig(JsonObject& root) override
-    {
-      JsonObject top = root[FPSTR(_name)];
-
-      bool configComplete = !top.isNull();
-
-      configComplete &= getJsonValue(top["great"], greatValue);
-      configComplete &= getJsonValue(top["testBool"], testBool);
-      configComplete &= getJsonValue(top["testULong"], testULong);
-      configComplete &= getJsonValue(top["testFloat"], testFloat);
-      configComplete &= getJsonValue(top["testString"], testString);
-
-      // A 3-argument getJsonValue() assigns the 3rd argument as a default value if the Json value is missing
-      configComplete &= getJsonValue(top["testInt"], testInt, 42);  
-      configComplete &= getJsonValue(top["testLong"], testLong, -42424242);
-
-      // "pin" fields have special handling in settings page (or some_pin as well)
-      configComplete &= getJsonValue(top["pin"][0], testPins[0], -1);
-      configComplete &= getJsonValue(top["pin"][1], testPins[1], -1);
-
-      return configComplete;
-    }
-
-
-    /*
-     * appendConfigData() is called when the Usermod Settings page renders.
-     * Write JavaScript snippets to settingsScript to add helper text or dropdowns for your config fields.
-     * addInfo('<ModName>:<key>', 1, '<html>') adds a tooltip/label next to the field.
-     * addDropdown / addOption replace a plain text input with a <select>.
-     */
-    void appendConfigData(Print& settingsScript) override
-    {
-      settingsScript.print(F("addInfo('")); settingsScript.print(FPSTR(_name)); settingsScript.print(F(":great',1,'<i>(this is a great config value)</i>');"));
-      settingsScript.print(F("addInfo('")); settingsScript.print(FPSTR(_name)); settingsScript.print(F(":testString',1,'enter any string you want');"));
-      settingsScript.print(F("dd=addDropdown('")); settingsScript.print(FPSTR(_name)); settingsScript.print(F("','testInt');"));
-      settingsScript.print(F("addOption(dd,'Nothing',0);"));
-      settingsScript.print(F("addOption(dd,'Everything',42);"));
-    }
-
-
-    /*
-     * handleOverlayDraw() is called just before every show() (LED strip update frame) after effects have set the colors.
-     * Use this to blank out some LEDs or set them to a different color regardless of the set effect mode.
-     * Commonly used for custom clocks (Cronixie, 7 segment)
-     */
-    void handleOverlayDraw() override
-    {
-      //strip.setPixelColor(0, RGBW32(0,0,0,0)) // set the first pixel to black
-    }
-
-
-    /**
-     * handleButton() can be used to override default button behaviour. Returning true
-     * will prevent button working in a default way.
-     * Replicating button.cpp
-     */
-    bool handleButton(uint8_t b) override {
-      yield();
-      // ignore certain button types as they may have other consequences
-      if (!enabled
-       || buttons[b].type == BTN_TYPE_NONE
-       || buttons[b].type == BTN_TYPE_RESERVED
-       || buttons[b].type == BTN_TYPE_PIR_SENSOR
-       || buttons[b].type == BTN_TYPE_ANALOG
-       || buttons[b].type == BTN_TYPE_ANALOG_INVERTED) {
-        return false;
+      if (enabled) {
+        allocatePins();
       }
 
-      bool handled = false;
-      // do your button handling here
-      return handled;
+      resetRuntime();
     }
-  
+
+    if (!haEnabled) {
+      haConnected = false;
+      haFlashActive = false;
+    }
+
+    return configComplete;
+  }
+
+  void appendConfigData() override
+  {
+    oappend(F(
+      "addInfo('WiFi Status LED:pin[]',0,'','Red');"
+    ));
+
+    oappend(F(
+      "addInfo('WiFi Status LED:pin[]',1,'','Blue');"
+    ));
+
+    oappend(F(
+      "dd=addDropdown('WiFi Status LED','polarity');"
+    ));
+
+    oappend(F(
+      "addOption(dd,'High',0);"
+    ));
+
+    oappend(F(
+      "addOption(dd,'Low',1);"
+    ));
+
+    oappend(F(
+      "dd=addDropdown('WiFi Status LED','blinkHz');"
+    ));
+
+    oappend(F(
+      "addOption(dd,'1 Hz',1);"
+    ));
+
+    oappend(F(
+      "addOption(dd,'2 Hz',2);"
+    ));
+
+    oappend(F(
+      "addOption(dd,'4 Hz',4);"
+    ));
+
+    oappend(F(
+      "addOption(dd,'8 Hz',8);"
+    ));
+  }
 
 #ifndef WLED_DISABLE_MQTT
-    /**
-     * onMqttMessage() is called when a subscribed MQTT topic receives a message.
-     * topic only contains stripped topic (part after /wled/MAC).
-     * Return true to mark the message handled (prevents other usermods from seeing it).
-     * These methods must be inside a #ifndef WLED_DISABLE_MQTT guard — MQTT support is a compile-time option.
-     * See usermods/multi_relay for a well-structured subscribe-in-connect / handle-in-message example.
-     */
-    bool onMqttMessage(char* topic, char* payload) override {
-      //if (strlen(topic) == 8 && strncmp_P(topic, PSTR("/command"), 8) == 0) {
-      //  String action = payload;
-      //  if (action == "on")     { enabled = true;  return true; }
-      //  if (action == "off")    { enabled = false; return true; }
-      //  if (action == "toggle") { enabled = !enabled; return true; }
-      //}
-      return false;
+
+  /*
+   * MQTT remains enabled.
+   * We do NOT use MQTT to detect HA anymore.
+   * The direct HA detection above is used instead.
+   */
+  void onMqttConnect(bool sessionPresent) override
+  {
+    if (
+      !enabled ||
+      !mqttEnabled
+    ) {
+      return;
     }
-
-    /**
-     * onMqttConnect() is called when MQTT connection is established.
-     * Subscribe to topics here; mqttDeviceTopic holds the device-specific prefix.
-     */
-    void onMqttConnect(bool sessionPresent) override {
-      //char subuf[64];
-      //if (mqttDeviceTopic[0] != 0) {
-      //  strcpy(subuf, mqttDeviceTopic);
-      //  strcat_P(subuf, PSTR("/command"));
-      //  mqtt->subscribe(subuf, 0);
-      //}
-    }
-#endif
-
-
-    /**
-     * onStateChanged() is used to detect WLED state change
-     * @mode parameter is CALL_MODE_... parameter used for notifications
-     */
-    void onStateChange(uint8_t mode) override {
-      // do something if WLED state changed (color, brightness, effect, preset, etc)
-    }
-
 
     /*
-     * getId() allows you to optionally give your usermod a unique ID.
-     * The base class returns USERMOD_ID_UNSPECIFIED, which is correct for most custom usermods.
-     * Override only if you need reliable cross-usermod lookup via UsermodManager::lookup()
-     * and have multiple usermods with the same ID registered simultaneously.
+     * Keep the MQTT connection alive for normal WLED/MQTT
+     * operation. No Home Assistant status subscription is needed.
      */
-    // uint16_t getId() override { return USERMOD_ID_UNSPECIFIED; }
+    DEBUG_PRINTLN(
+      F("WiFiStatusLED: MQTT connected.")
+    );
+  }
 
-   //More methods can be added in the future, this example will then be extended.
-   //Your usermod will remain compatible as it does not need to implement all methods from the Usermod base class!
+  bool onMqttMessage(
+    char* topic,
+    char* payload
+  ) override
+  {
+    /*
+     * MQTT is intentionally kept available.
+     * HA detection is handled through direct WLED activity.
+     */
+    (void)topic;
+    (void)payload;
+
+    return false;
+  }
+
+#endif
+
+  uint16_t getId() override
+  {
+    return USERMOD_ID_WIFI_STATUS_LED;
+  }
 };
 
+const char WiFiStatusLEDUsermod::_name[] PROGMEM =
+  "WiFi Status LED";
 
-// add more strings here to reduce flash memory usage
-const char MyExampleUsermod::_name[]    PROGMEM = "ExampleUsermod";
-const char MyExampleUsermod::_enabled[] PROGMEM = "enabled";
+const char WiFiStatusLEDUsermod::_enabled[] PROGMEM =
+  "enabled";
 
+static WiFiStatusLEDUsermod wifiStatusLED;
 
-// implementation of non-inline member methods
-
-void MyExampleUsermod::publishMqtt(const char* state, bool retain)
-{
-#ifndef WLED_DISABLE_MQTT
-  //Check if MQTT Connected, otherwise it will crash the 8266
-  if (WLED_MQTT_CONNECTED) {
-    char subuf[64];
-    strcpy(subuf, mqttDeviceTopic);
-    strcat_P(subuf, PSTR("/example"));
-    mqtt->publish(subuf, 0, retain, state);
-  }
-#endif
-}
-
-static MyExampleUsermod example_usermod;
-REGISTER_USERMOD(example_usermod);
+REGISTER_USERMOD(wifiStatusLED);
