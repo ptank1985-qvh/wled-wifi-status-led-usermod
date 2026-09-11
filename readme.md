@@ -1,72 +1,230 @@
-# WLED usermod example
+# WLED WiFi Status LED Usermod
 
-This repository is a [GitHub template](https://docs.github.com/en/repositories/creating-and-managing-repositories/creating-a-repository-from-a-template) for building your own [WLED](https://github.com/wled/WLED) usermod as a standalone project. Create a new repository from it, add your code, link it to WLED, and make the world a brighter place!
+A WLED Usermod that provides a simple visual indication of the WLED device's network and connection status using a dual-colour Red + Blue LED.
 
-## Getting started
+The Usermod monitors WiFi, WLED AP mode, MQTT, and Home Assistant activity and displays the corresponding status through the LED.
 
-### 1. Create from template
+## Features
 
-Click **Use this template** → **Create a new repository** on GitHub. You get a clean copy to start building your project from. Then:
+- WiFi connection status indication
+- WLED Access Point (AP) mode indication
+- MQTT connection indication
+- Home Assistant connection indication
+- Configurable Red and Blue GPIO pins
+- Support for Common Anode or Common Cathode dual-colour LEDs
+- Configurable LED polarity
+- Configurable WiFi connection blink frequency
+- GPIO conflict protection using WLED PinManager
+- Optional MQTT status handling
+- Optional Home Assistant detection
+- Non-blocking status updates without long delays
 
-- Rename `usermod_example.cpp` to something descriptive (e.g. `my_sensor.cpp`)
-- Rename the class inside from `MyExampleUsermod` to match
-- Update `"name"` in `library.json` to match your repository name
+---
 
-### 2. Wire it into your WLED build
+## Recommended Hardware
 
-Clone your new repository alongside your WLED checkout:
+This Usermod is specifically designed for a **3-pin, 2-colour dual-colour LED**.
 
-```
-~/projects/
-  WLED/
-  wled-usermod-my_sensor/
-    library.json
-    my_sensor.cpp
-```
+### Recommended LED
 
-In `platformio_override.ini` inside the WLED folder, add a `symlink://` reference to your local clone:
+- Dual-colour **Red + Blue LED**
+- Common Anode (CA) or Common Cathode (CC)
+- One common connection
+- Separate Red and Blue control connections
 
-```ini
-[env:esp32dev]
-extends = env:esp32dev
-custom_usermods =
-  ${env:esp32dev.custom_usermods}
-  symlink:///home/you/projects/wled-usermod-my_sensor
-```
+The Usermod provides a polarity setting so the LED can be configured according to the type of hardware being used.
 
-Add both projects to the same VS Code workspace if you want to edit them together. PlatformIO picks up your changes on each build.
+> **Important:** This Usermod is intended specifically for a Common Anode or Common Cathode dual-colour Red + Blue LED. Using different LED hardware or different LED colours may produce different visual results.
 
-### 3. Share it
+Use an appropriate current-limiting resistor for the LED and make sure the selected GPIO pins are suitable for your WLED hardware.
 
-Tag your working version and add your usermod to the [Community Usermods page](https://kno.wled.ge/advanced/community-usermods/) by sending a PR to [WLED-Docs](https://github.com/wled/WLED-Docs).  Other developers can add your usermod to their builds by adding your repository to their build's `custom_usermods`!
+---
 
-```ini
-custom_usermods =
-  ${env:esp32dev.custom_usermods}
-  https://github.com/you/wled-usermod-my_sensor.git#v1.0.0
-```
+## LED Status
 
-
-## What's in this repo
-
-**`library.json`** — PlatformIO library manifest. The `"libArchive": false` setting is required; without it the build will fail. Add any library dependencies here.
-
-**`usermod_example.cpp`** — A fully annotated example covering all available lifecycle hooks:
-
-| Method | When called |
+| WLED / Network Status | LED Output |
 |---|---|
-| `setup()` | Once at boot, after config is loaded, before WiFi |
-| `connected()` | Each time WiFi (re)connects |
-| `loop()` | Every main loop iteration |
-| `addToJsonInfo()` | When `/json/info` is requested |
-| `addToJsonState()` / `readFromJsonState()` | On `/json/state` get/post |
-| `addToConfig()` / `readFromConfig()` | Persistent settings in `cfg.json` |
-| `appendConfigData()` | When the Usermod Settings page renders |
-| `handleOverlayDraw()` | Just before each LED strip update |
-| `handleButton()` | On button events |
-| `onMqttMessage()` / `onMqttConnect()` | MQTT events |
-| `onStateChange()` | When WLED state changes |
+| WiFi discovery / connecting | Red blinking |
+| WLED AP mode | Red |
+| WiFi connected | Blue |
+| MQTT connected | Red + Blue |
+| Home Assistant connected | Red + Blue with a short OFF flash every 3 seconds |
 
-`REGISTER_USERMOD(instance)` at the bottom of the file handles self-registration — there is no `usermods_list.cpp` to edit.
+### Combined Red + Blue
 
-For full documentation see the [WLED Custom Features](https://kno.wled.ge/advanced/custom-features/) page.
+The Usermod controls the Red and Blue LED channels independently.
+
+With the recommended Red + Blue dual-colour LED:
+
+- Red channel ON → **Red**
+- Blue channel ON → **Blue**
+- Red + Blue channels ON → **Purple**
+
+The Purple indication is produced by the dual-colour LED hardware when both Red and Blue channels are active.
+
+The Usermod does **not** perform software colour mixing.
+
+---
+
+## Connection Priority
+
+When multiple connection conditions are present, the Usermod uses the following priority:
+
+1. Home Assistant connection
+2. MQTT connection
+3. WiFi connection
+4. WLED AP mode
+5. WiFi discovery / connecting
+
+Home Assistant status takes priority when an active direct connection is detected.
+
+---
+
+## Configuration
+
+The Usermod provides configuration through the WLED Usermod settings.
+
+### Red GPIO
+
+GPIO used to control the Red LED channel.
+
+### Blue GPIO
+
+GPIO used to control the Blue LED channel.
+
+The Red and Blue GPIO pins must be different.
+
+### LED Polarity
+
+Select the polarity required by your LED hardware:
+
+- **High** — LED channel is active when the GPIO is HIGH
+- **Low** — LED channel is active when the GPIO is LOW
+
+This allows the Usermod to work with the intended Common Anode or Common Cathode dual-colour LED configuration.
+
+### Blink Frequency
+
+The WiFi connecting indicator can be configured to:
+
+- 1 Hz
+- 2 Hz
+- 4 Hz
+- 8 Hz
+
+---
+
+## MQTT
+
+MQTT handling can be enabled or disabled from the Usermod settings.
+
+When MQTT is connected and no higher-priority Home Assistant status is active, both Red and Blue channels are turned ON.
+
+The Usermod does not use MQTT to detect the Home Assistant connection.
+
+MQTT remains available for normal WLED/MQTT operation.
+
+---
+
+## Home Assistant
+
+Home Assistant detection can be enabled or disabled.
+
+The Usermod uses direct WLED WebSocket/API activity as the Home Assistant activity signal.
+
+When an active Home Assistant connection is detected:
+
+- Red + Blue channels remain ON
+- The LED briefly turns OFF every 3 seconds
+- Normal MQTT functionality remains available
+
+The OFF flash duration is approximately 180 ms.
+
+---
+
+## GPIO Protection
+
+The Usermod uses WLED's **PinManager** when allocating the configured GPIO pins.
+
+If a selected GPIO is already reserved or unavailable, the Usermod will not use that pin.
+
+This helps prevent GPIO conflicts with other WLED functions or Usermods.
+
+---
+
+## Installation
+
+This project is provided as a standalone WLED Usermod repository.
+
+Repository:
+
+https://github.com/ptank1985-qvh/wled-wifi-status-led-usermod
+
+The Usermod is intended to be integrated into a WLED build using WLED's custom Usermod mechanism.
+
+Please refer to the WLED documentation for the current procedure for adding standalone Usermods to a build.
+
+---
+
+## Compatibility
+
+This Usermod is based on the WLED Usermod v2 API.
+
+It is intended for WLED builds that provide the APIs used by this Usermod, including:
+
+- Usermod v2
+- WLED WiFi connection status
+- WLED AP mode status
+- MQTT status
+- WebSocket/API activity
+- WLED PinManager
+
+Always test the Usermod with your specific WLED version and hardware before deploying it to a production device.
+
+---
+
+## Troubleshooting
+
+### LED does not turn ON
+
+Check:
+
+1. The selected GPIO numbers.
+2. LED wiring.
+3. The Common Anode / Common Cathode configuration.
+4. The selected polarity setting.
+5. Whether the GPIO is already being used by another WLED feature or Usermod.
+
+### Red and Blue appear reversed
+
+Check the Red and Blue GPIO connections and verify that the configured GPIOs match the physical LED channels.
+
+### Purple does not appear
+
+Purple requires both the Red and Blue channels to be active simultaneously.
+
+The actual combined colour depends on the LED hardware being used.
+
+---
+
+## Safety and Hardware Notes
+
+Always use an appropriate current-limiting resistor with the LED.
+
+Do not connect an LED directly to a GPIO without suitable current limiting.
+
+Verify the electrical characteristics and GPIO limitations of your specific ESP/WLED hardware before making connections.
+
+---
+
+## License
+
+MIT License
+
+---
+
+## Author
+
+Created as a community WLED Usermod.
+
+If you find a problem or have an improvement, please open an issue or pull request in this repository.
