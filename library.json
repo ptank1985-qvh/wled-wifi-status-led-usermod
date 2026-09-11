@@ -9,5 +9,7 @@
   "license": "MIT",
   "frameworks": "arduino",
   "platforms": "*",
-  "libArchive": false
+  "build": {
+    "libArchive": false
+  }
 }
